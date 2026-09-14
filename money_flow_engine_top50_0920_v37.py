@@ -19,7 +19,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 # ============================================================
-# UPSTOX MONEY-FLOW F&O MARKET ENGINE v3.7 — TOP 50 @ 09:20 IST
+# UPSTOX MONEY-FLOW F&O MARKET ENGINE v3.8 — TOP 50 @ 09:20 IST
 # ============================================================
 # - Multi-symbol watchlist
 # - Automatic NSE instrument discovery from Upstox instrument master
@@ -142,6 +142,9 @@ CSV_HEADERS = [
     "put_oi_change_3m", "pcr", "pcr_change_3m", "pcr_acceleration",
     "call_iv", "put_iv", "call_iv_change_3m", "put_iv_change_3m",
     "call_iv_acceleration", "put_iv_acceleration", "call_gamma", "put_gamma",
+    "future_price_change_3m_pct", "future_oi_change_3m_pct",
+    "futures_flow_3m_cr", "options_flow_3m_cr", "total_flow_3m_cr",
+    "money_flow_acceleration_3m_cr",
     "call_fresh_value_cr", "put_fresh_value_cr", "atm_call_oi_change_3m",
     "atm_put_oi_change_3m", "atm_call_unwinding", "atm_put_unwinding",
     "zone_state", "next_zone", "stock_change_pct", "nifty_change_pct",
@@ -790,6 +793,7 @@ def build_symbol_context(master, symbol, reference_price=None, selection_info=No
         "previous_call_iv_change": None,
         "previous_put_iv_change": None,
         "previous_pcr_change": None,
+        "previous_live_flow_3m_cr": None,
         "previous_relative_strength": None,
         "previous_zone_state": None,
         "last_snapshot_key": None,
@@ -1125,6 +1129,30 @@ def save_money_flow_option_snapshots_to_neon(ctx, timestamp, snapshot, previous_
         return False
 
 
+def ensure_stock_engine_structure_columns():
+    """Add v3.8 structure-first 3-minute fields without breaking older deployments."""
+    if not NEON_DATABASE_URL:
+        return False
+    sql = """
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS future_price_change_3m_pct NUMERIC;
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS future_oi_change_3m_pct NUMERIC;
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS futures_flow_3m_cr NUMERIC;
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS options_flow_3m_cr NUMERIC;
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS total_flow_3m_cr NUMERIC;
+        ALTER TABLE public.stock_engine_snapshots ADD COLUMN IF NOT EXISTS money_flow_acceleration_3m_cr NUMERIC;
+    """
+    try:
+        with psycopg.connect(NEON_DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+        print("STOCK ENGINE v3.8 STRUCTURE COLUMNS : READY")
+        return True
+    except Exception as e:
+        print(f"STOCK ENGINE v3.8 COLUMN ERROR : {e}")
+        return False
+
+
 def save_snapshot_to_neon(ctx, row):
     if not NEON_DATABASE_URL:
         return False
@@ -1138,6 +1166,8 @@ def save_snapshot_to_neon(ctx, row):
             call_oi_change_3m, put_oi_change_3m, pcr, pcr_change_3m, pcr_acceleration,
             call_iv, put_iv, call_iv_change_3m, put_iv_change_3m,
             call_iv_acceleration, put_iv_acceleration, call_gamma, put_gamma,
+            future_price_change_3m_pct, future_oi_change_3m_pct,
+            futures_flow_3m_cr, options_flow_3m_cr, total_flow_3m_cr, money_flow_acceleration_3m_cr,
             call_fresh_value_cr, put_fresh_value_cr,
             atm_call_oi_change_3m, atm_put_oi_change_3m,
             atm_call_unwinding, atm_put_unwinding, zone_state, next_zone
@@ -1149,6 +1179,8 @@ def save_snapshot_to_neon(ctx, row):
             %(call_oi_change_3m)s, %(put_oi_change_3m)s, %(pcr)s, %(pcr_change_3m)s, %(pcr_acceleration)s,
             %(call_iv)s, %(put_iv)s, %(call_iv_change_3m)s, %(put_iv_change_3m)s,
             %(call_iv_acceleration)s, %(put_iv_acceleration)s, %(call_gamma)s, %(put_gamma)s,
+            %(future_price_change_3m_pct)s, %(future_oi_change_3m_pct)s,
+            %(futures_flow_3m_cr)s, %(options_flow_3m_cr)s, %(total_flow_3m_cr)s, %(money_flow_acceleration_3m_cr)s,
             %(call_fresh_value_cr)s, %(put_fresh_value_cr)s,
             %(atm_call_oi_change_3m)s, %(atm_put_oi_change_3m)s,
             %(atm_call_unwinding)s, %(atm_put_unwinding)s, %(zone_state)s, %(next_zone)s
@@ -1217,6 +1249,12 @@ def save_dashboard_snapshot_to_neon(ctx, row):
         "put_iv_change_3m": row.get("put_iv_change_3m"),
         "call_iv_acceleration": row.get("call_iv_acceleration"),
         "put_iv_acceleration": row.get("put_iv_acceleration"),
+        "future_price_change_3m_pct": row.get("future_price_change_3m_pct"),
+        "future_oi_change_3m_pct": row.get("future_oi_change_3m_pct"),
+        "futures_flow_3m_cr": row.get("futures_flow_3m_cr"),
+        "options_flow_3m_cr": row.get("options_flow_3m_cr"),
+        "total_flow_3m_cr": row.get("total_flow_3m_cr"),
+        "money_flow_acceleration_3m_cr": row.get("money_flow_acceleration_3m_cr"),
         "call_fresh_value_cr": row.get("call_fresh_value_cr"),
         "put_fresh_value_cr": row.get("put_fresh_value_cr"),
         "atm_call_oi_change_3m": row.get("atm_call_oi_change_3m"),
@@ -1396,6 +1434,39 @@ def process_symbol_snapshot(ctx, timestamp, snapshot):
         future_oi - safe_number(prev.get(ctx["future_key"], {}).get("oi")) if prev else 0
     )
 
+    prev_future = safe_number(prev.get(ctx["future_key"], {}).get("ltp")) if prev else 0
+    prev_future_oi = safe_number(prev.get(ctx["future_key"], {}).get("oi")) if prev else 0
+    future_price_change_3m_pct = pct_change(future, prev_future) if prev_future else 0.0
+    future_oi_change_3m_pct = pct_change(future_oi, prev_future_oi) if prev_future_oi else 0.0
+
+    # Live 3-minute traded-value activity from incremental volume/VTT.
+    fut_now_volume = safe_number(fut_row.get("volume"))
+    fut_prev_volume = safe_number(prev.get(ctx["future_key"], {}).get("volume")) if prev else fut_now_volume
+    fut_delta_volume = max(0.0, fut_now_volume - fut_prev_volume)
+    fut_multiplier = 1 if FUT_VOLUME_IS_UNITS else max(1, int(ctx.get("lot_size") or 1))
+    futures_flow_3m_cr = fut_delta_volume * future * fut_multiplier / 10_000_000
+
+    options_flow_rupees = 0.0
+    if prev:
+        for key in ctx["option_meta"]:
+            now_opt = snapshot.get(key)
+            old_opt = prev.get(key)
+            if not now_opt or not old_opt:
+                continue
+            now_vol = safe_number(now_opt.get("volume"))
+            old_vol = safe_number(old_opt.get("volume"))
+            delta_vol = max(0.0, now_vol - old_vol)
+            ltp = safe_number(now_opt.get("ltp"))
+            opt_multiplier = 1 if OPT_VOLUME_IS_UNITS else max(1, int(ctx.get("lot_size") or 1))
+            options_flow_rupees += delta_vol * ltp * opt_multiplier
+    options_flow_3m_cr = options_flow_rupees / 10_000_000
+    total_flow_3m_cr = futures_flow_3m_cr + options_flow_3m_cr
+    previous_live_flow = ctx.get("previous_live_flow_3m_cr")
+    money_flow_acceleration_3m_cr = (
+        total_flow_3m_cr - previous_live_flow
+        if previous_live_flow is not None else 0.0
+    )
+
     call_oi = total_option_oi(ctx, snapshot, "CE")
     put_oi = total_option_oi(ctx, snapshot, "PE")
     t0_call_oi = total_option_oi(ctx, t0, "CE")
@@ -1511,6 +1582,12 @@ def process_symbol_snapshot(ctx, timestamp, snapshot):
         "put_iv_acceleration": put_iv_acceleration,
         "call_gamma": call_gamma,
         "put_gamma": put_gamma,
+        "future_price_change_3m_pct": future_price_change_3m_pct,
+        "future_oi_change_3m_pct": future_oi_change_3m_pct,
+        "futures_flow_3m_cr": futures_flow_3m_cr,
+        "options_flow_3m_cr": options_flow_3m_cr,
+        "total_flow_3m_cr": total_flow_3m_cr,
+        "money_flow_acceleration_3m_cr": money_flow_acceleration_3m_cr,
         "call_fresh_value_cr": call_fresh_value,
         "put_fresh_value_cr": put_fresh_value,
         "atm_call_oi_change_3m": atm_call_oi_change_3m,
@@ -1528,7 +1605,7 @@ def process_symbol_snapshot(ctx, timestamp, snapshot):
     }
 
     print("\n" + "=" * 100)
-    print(f"ENGINE v3.5 | #{ctx.get('money_flow_rank','-')} {ctx['symbol']} | {timestamp}")
+    print(f"ENGINE v3.8 | #{ctx.get('money_flow_rank','-')} {ctx['symbol']} | {timestamp}")
     print("=" * 100)
     print(f"Money Flow (Cr)   : Fut {ctx.get('futures_value_cr',0):.2f} + Opt {ctx.get('options_value_cr',0):.2f} = {ctx.get('total_money_flow_cr',0):.2f}")
     print(f"Spot/Future/Basis : {spot:.2f} / {future:.2f} / {future - spot:+.2f}")
@@ -1552,11 +1629,13 @@ def process_symbol_snapshot(ctx, timestamp, snapshot):
     ctx["previous_call_iv_change"] = call_iv_change
     ctx["previous_put_iv_change"] = put_iv_change
     ctx["previous_pcr_change"] = pcr_change
+    ctx["previous_live_flow_3m_cr"] = total_flow_3m_cr
     ctx["previous_relative_strength"] = relative_strength
     ctx["previous_zone_state"] = zone_state
 
 
 ensure_money_flow_option_snapshot_table()
+ensure_stock_engine_structure_columns()
 initialize_csv()
 
 # ============================================================
@@ -1760,7 +1839,7 @@ session_complete_announced = False
 
 def on_open():
     print("\n" + "=" * 100)
-    print("CONNECTED TO UPSTOX | MONEY-FLOW MARKET ENGINE v3.7 TOP50 @ 09:20")
+    print("CONNECTED TO UPSTOX | MONEY-FLOW MARKET ENGINE v3.8 TOP50 @ 09:20")
     print("=" * 100)
     print("IST Time          :", current_ist().strftime("%Y-%m-%d %H:%M:%S"))
     print("Market Window     : money-flow freeze -> 15:15 IST")
