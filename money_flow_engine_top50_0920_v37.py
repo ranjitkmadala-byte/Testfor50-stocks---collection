@@ -19,7 +19,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 # ============================================================
-# UPSTOX MONEY-FLOW F&O MARKET ENGINE v3.8 — TOP 50 @ 09:20 IST
+# UPSTOX MONEY-FLOW F&O MARKET ENGINE v3.9 — TOP 50 @ 09:20 IST
 # ============================================================
 # - Multi-symbol watchlist
 # - Automatic NSE instrument discovery from Upstox instrument master
@@ -82,6 +82,9 @@ MONEY_FLOW_FREEZE_HOUR = int(os.getenv("MONEY_FLOW_FREEZE_HOUR", "9"))
 MONEY_FLOW_FREEZE_MINUTE = int(os.getenv("MONEY_FLOW_FREEZE_MINUTE", "20"))
 MONEY_FLOW_FREEZE_TIME = dtime(MONEY_FLOW_FREEZE_HOUR, MONEY_FLOW_FREEZE_MINUTE)
 ALLOW_UNIVERSE_REBUILD = os.getenv("ALLOW_UNIVERSE_REBUILD", "false").lower() == "true"
+AUTO_REPAIR_INVALID_UNIVERSE = os.getenv("AUTO_REPAIR_INVALID_UNIVERSE", "true").lower() == "true"
+# PostgreSQL advisory lock: only one v3.8+ process may replace a day's frozen universe.
+UNIVERSE_LOCK_ID = 92050
 MAX_FULL_FEED_INSTRUMENTS = int(os.getenv("MAX_FULL_FEED_INSTRUMENTS", "2000"))
 QUOTE_BATCH_SIZE = 500
 FULL_QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
@@ -597,8 +600,37 @@ def is_verified_frozen_universe(rows):
 
 
 def save_money_flow_universe_to_neon(rows, freeze_ts):
+    """Atomically replace today's universe with exactly ranks 1..TOP_N.
+
+    The transaction-level advisory lock prevents two new collector instances
+    from interleaving DELETE/INSERT operations. Rows are re-ranked here so the
+    persisted universe is always exactly 1..MONEY_FLOW_TOP_N.
+    """
     if not NEON_DATABASE_URL:
         return
+
+    rows = list(rows)[:MONEY_FLOW_TOP_N]
+    if len(rows) != MONEY_FLOW_TOP_N:
+        raise RuntimeError(
+            f"Refusing universe write: got {len(rows)} rows; "
+            f"expected exactly {MONEY_FLOW_TOP_N}."
+        )
+
+    normalized = []
+    seen = set()
+    for rank, row in enumerate(rows, 1):
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol or symbol in seen:
+            raise RuntimeError(f"Duplicate/blank symbol in Top {MONEY_FLOW_TOP_N}: {symbol!r}")
+        seen.add(symbol)
+        payload = dict(row)
+        payload["rank"] = rank
+        payload["symbol"] = symbol
+        payload["trading_date"] = freeze_ts.date()
+        payload["freeze_ts"] = freeze_ts
+        payload["selection_method"] = "FUTURES_PLUS_NEAR_ATM_OPTIONS_TOP50_0920_FROZEN"
+        normalized.append(payload)
+
     sql = """
         INSERT INTO public.money_flow_universe (
             trading_date, freeze_ts, rank, symbol, future_instrument_key,
@@ -614,6 +646,8 @@ def save_money_flow_universe_to_neon(rows, freeze_ts):
         ON CONFLICT (trading_date, symbol) DO UPDATE SET
             freeze_ts = EXCLUDED.freeze_ts,
             rank = EXCLUDED.rank,
+            future_instrument_key = EXCLUDED.future_instrument_key,
+            spot_instrument_key = EXCLUDED.spot_instrument_key,
             futures_value_cr = EXCLUDED.futures_value_cr,
             options_value_cr = EXCLUDED.options_value_cr,
             total_money_flow_cr = EXCLUDED.total_money_flow_cr,
@@ -623,39 +657,51 @@ def save_money_flow_universe_to_neon(rows, freeze_ts):
             spot_price = EXCLUDED.spot_price,
             selection_method = EXCLUDED.selection_method
     """
-    try:
-        with psycopg.connect(NEON_DATABASE_URL, connect_timeout=10) as conn:
-            with conn.cursor() as cur:
-                # One authoritative universe per date. This also removes stale
-                # rows if an explicitly authorized same-day rebuild is run.
-                cur.execute(
-                    "DELETE FROM public.money_flow_universe WHERE trading_date = %s",
-                    (freeze_ts.date(),),
+
+    with psycopg.connect(NEON_DATABASE_URL, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            # Serialise all v3.8+ universe replacements.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (UNIVERSE_LOCK_ID,))
+
+            # One authoritative frozen universe per trading date.
+            cur.execute(
+                "DELETE FROM public.money_flow_universe WHERE trading_date = %s",
+                (freeze_ts.date(),),
+            )
+            cur.executemany(sql, normalized)
+
+            cur.execute(
+                """SELECT COUNT(*), COUNT(DISTINCT symbol), COUNT(DISTINCT rank),
+                          MIN(rank), MAX(rank)
+                   FROM public.money_flow_universe
+                   WHERE trading_date = %s""",
+                (freeze_ts.date(),),
+            )
+            count, symbols, ranks, min_rank, max_rank = cur.fetchone()
+            expected = (MONEY_FLOW_TOP_N, MONEY_FLOW_TOP_N, MONEY_FLOW_TOP_N, 1, MONEY_FLOW_TOP_N)
+            actual = (count, symbols, ranks, min_rank, max_rank)
+            if actual != expected:
+                raise RuntimeError(
+                    "Universe verification failed after atomic write: "
+                    f"rows={count}, symbols={symbols}, distinct_ranks={ranks}, "
+                    f"rank_range={min_rank}-{max_rank}; expected {expected}."
                 )
-                for row in rows:
-                    payload = dict(row)
-                    payload["trading_date"] = freeze_ts.date()
-                    payload["freeze_ts"] = freeze_ts
-                    payload["selection_method"] = "FUTURES_PLUS_NEAR_ATM_OPTIONS_TOP50_0920"
-                    cur.execute(sql, payload)
-                cur.execute(
-                    """SELECT COUNT(*), MIN(rank), MAX(rank), COUNT(DISTINCT symbol)
-                       FROM public.money_flow_universe WHERE trading_date = %s""",
-                    (freeze_ts.date(),),
-                )
-                count, min_rank, max_rank, symbols = cur.fetchone()
-                if (count, min_rank, max_rank, symbols) != (
-                    MONEY_FLOW_TOP_N, 1, MONEY_FLOW_TOP_N, MONEY_FLOW_TOP_N
-                ):
-                    raise RuntimeError(
-                        f"Universe verification failed: rows={count}, ranks={min_rank}-{max_rank}, "
-                        f"symbols={symbols}; expected exactly {MONEY_FLOW_TOP_N}."
-                    )
-            conn.commit()
-        print(f"Money-flow universe written to Neon: {len(rows)} rows")
-    except Exception as e:
-        print("MONEY FLOW NEON ERROR:", e)
-        raise
+
+            cur.execute(
+                """SELECT rank FROM public.money_flow_universe
+                   WHERE trading_date=%s ORDER BY rank""",
+                (freeze_ts.date(),),
+            )
+            persisted_ranks = [int(r[0]) for r in cur.fetchall()]
+            if persisted_ranks != list(range(1, MONEY_FLOW_TOP_N + 1)):
+                raise RuntimeError(f"Persisted ranks are not exactly 1..{MONEY_FLOW_TOP_N}")
+
+        conn.commit()
+
+    print(
+        f"Money-flow universe ATOMICALLY FROZEN in Neon: "
+        f"{MONEY_FLOW_TOP_N} rows, ranks 1-{MONEY_FLOW_TOP_N}"
+    )
 
 
 def historical_daily_candles(instrument_key, days=40):
@@ -1605,7 +1651,7 @@ def process_symbol_snapshot(ctx, timestamp, snapshot):
     }
 
     print("\n" + "=" * 100)
-    print(f"ENGINE v3.8 | #{ctx.get('money_flow_rank','-')} {ctx['symbol']} | {timestamp}")
+    print(f"ENGINE v3.9 | #{ctx.get('money_flow_rank','-')} {ctx['symbol']} | {timestamp}")
     print("=" * 100)
     print(f"Money Flow (Cr)   : Fut {ctx.get('futures_value_cr',0):.2f} + Opt {ctx.get('options_value_cr',0):.2f} = {ctx.get('total_money_flow_cr',0):.2f}")
     print(f"Spot/Future/Basis : {spot:.2f} / {future:.2f} / {future - spot:+.2f}")
@@ -1654,10 +1700,19 @@ if existing_rankings and is_verified_frozen_universe(existing_rankings) and not 
     freeze_ts = existing_rankings[0]["freeze_ts"]
     print(f"Reusing today's verified frozen universe: {len(selected_rankings)} stocks")
 elif existing_rankings and not ALLOW_UNIVERSE_REBUILD:
-    raise RuntimeError(
-        f"Today's universe contains {len(existing_rankings)} rows, expected {MONEY_FLOW_TOP_N}. "
-        "Set ALLOW_UNIVERSE_REBUILD=true once to replace it, then return it to false."
-    )
+    if AUTO_REPAIR_INVALID_UNIVERSE:
+        print(
+            f"INVALID FROZEN UNIVERSE detected: {len(existing_rankings)} rows. "
+            f"Automatically rebuilding exactly Top {MONEY_FLOW_TOP_N} once."
+        )
+        existing_rankings = []
+        freeze_ts = current_ist()
+    else:
+        raise RuntimeError(
+            f"Today's universe contains {len(existing_rankings)} rows, expected {MONEY_FLOW_TOP_N}. "
+            "Set AUTO_REPAIR_INVALID_UNIVERSE=true (recommended) or "
+            "ALLOW_UNIVERSE_REBUILD=true once to repair it."
+        )
 else:
     freeze_ts = current_ist()
 print("\n" + "#" * 100)
@@ -1676,6 +1731,9 @@ if not existing_rankings or ALLOW_UNIVERSE_REBUILD:
             f"refusing to freeze a partial Top {MONEY_FLOW_TOP_N}."
         )
     selected_rankings = all_rankings[:MONEY_FLOW_TOP_N]
+    # Persisted ranks must always be exactly 1..TOP_N, independent of upstream ranking.
+    for _rank, _row in enumerate(selected_rankings, 1):
+        _row["rank"] = _rank
 
 if not selected_rankings:
     raise RuntimeError("Money-flow scan returned no eligible stocks")
@@ -1839,7 +1897,7 @@ session_complete_announced = False
 
 def on_open():
     print("\n" + "=" * 100)
-    print("CONNECTED TO UPSTOX | MONEY-FLOW MARKET ENGINE v3.8 TOP50 @ 09:20")
+    print("CONNECTED TO UPSTOX | MONEY-FLOW MARKET ENGINE v3.9 TOP50 @ 09:20")
     print("=" * 100)
     print("IST Time          :", current_ist().strftime("%Y-%m-%d %H:%M:%S"))
     print("Market Window     : money-flow freeze -> 15:15 IST")
